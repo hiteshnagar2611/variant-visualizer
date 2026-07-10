@@ -7,15 +7,15 @@
     <script src="https://cdn.jsdelivr.net/npm/3dmol@2.4.2/build/3Dmol-min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; color: #1e293b; overflow: hidden; height: 100vh; }
-        .topbar { background: #1e293b; border-bottom: 1px solid #475569; padding: 8px 16px; display: flex; align-items: center; gap: 16px; height: 48px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; color: #1e293b; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+        .topbar { background: #1e293b; border-bottom: 1px solid #475569; padding: 8px 16px; display: flex; align-items: center; gap: 16px; height: 48px; flex-shrink: 0; }
         .topbar h1 { font-size: 15px; font-weight: 600; color: #f8fafc; white-space: nowrap; }
         .topbar .sep { width: 1px; height: 24px; background: #64748b; }
         .gene-select { background: #0f172a; border: 1px solid #64748b; color: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 13px; width: 260px; }
         .gene-select:focus { outline: none; border-color: #3b82f6; }
         .stats { font-size: 12px; color: #cbd5e1; margin-left: auto; white-space: nowrap; }
         .stats span { color: #fbbf24; font-weight: 600; }
-        .main { display: flex; height: calc(100vh - 48px); }
+        .main { display: flex; flex: 1; min-height: 0; }
         .viewer-wrap { flex: 1; position: relative; background: #ffffff; }
         #viewport { width: 100%; height: 100%; position: relative; }
         .viewer-loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #64748b; font-size: 14px; display: none; text-align: center; }
@@ -58,6 +58,25 @@
         .welcome { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #94a3b8; text-align: center; padding: 40px; }
         .welcome h2 { font-size: 20px; color: #475569; margin-bottom: 8px; }
         .welcome p { font-size: 13px; line-height: 1.6; }
+
+        /* ── Track panel (UniProt-style feature viewer) ── */
+        .track-panel { flex-shrink: 0; height: 132px; background: #ffffff; border-top: 1px solid #e2e8f0; display: flex; flex-direction: column; }
+        .track-header { display: flex; align-items: center; gap: 10px; padding: 6px 12px 2px; }
+        .track-title { font-size: 12px; font-weight: 600; color: #475569; }
+        .track-toggle { font-size: 11px; padding: 3px 10px; border-radius: 12px; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; cursor: pointer; user-select: none; transition: all 0.15s; }
+        .track-toggle.active { background: #3b82f6; border-color: #3b82f6; color: #ffffff; }
+        .track-axis-label { font-size: 11px; color: #94a3b8; margin-left: auto; }
+        #trackCanvas { flex: 1; width: 100%; display: block; cursor: crosshair; }
+
+        /* ── Info tooltip (body-level, used by 3D + track) ── */
+        #infoTip { position: fixed; background: #1e293b; border: 1px solid #475569; border-radius: 8px; padding: 9px 11px; font-size: 12px; z-index: 300; pointer-events: none; display: none; max-width: 300px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); color: #e2e8f0; }
+        #infoTip.active { display: block; }
+        #infoTip h3 { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+        #infoTip .tt-row { display: flex; justify-content: space-between; gap: 14px; padding: 1px 0; }
+        #infoTip .tt-label { color: #94a3b8; }
+        #infoTip .tt-val { font-weight: 500; }
+        #infoTip .tt-vars { margin-top: 5px; border-top: 1px solid #334155; padding-top: 5px; }
+        #infoTip .tt-var-item { padding: 1px 0; font-size: 11px; }
     </style>
 </head>
 <body>
@@ -93,7 +112,6 @@
             <button class="zoom-btn" id="zoomOut" title="Zoom Out">−</button>
             <button class="zoom-btn" id="zoomReset" title="Reset View">⌂</button>
         </div>
-        <div class="tooltip" id="tooltip"></div>
     </div>
 
     <div class="sidebar">
@@ -111,6 +129,17 @@
         </div>
     </div>
 </div>
+
+<div class="track-panel" id="trackPanel" style="display:none;">
+    <div class="track-header">
+        <span class="track-title">Sequence features</span>
+        <span class="track-toggle active" id="togglePlddt">pLDDT</span>
+        <span class="track-toggle" id="toggleDomains">Domains</span>
+        <span class="track-axis-label" id="axisLabel"></span>
+    </div>
+    <canvas id="trackCanvas"></canvas>
+</div>
+<div id="infoTip"></div>
 
 <script>
 const ALPHAFOLD_URL = 'https://alphafold.ebi.ac.uk/files/AF-{uniprot}-F1-model_v6.pdb';
@@ -139,6 +168,14 @@ let genesData = [];
 let variantsData = {};
 let currentVariants = null;
 let hoveredResi = null;
+let selectedResi = null;
+let pLddtByResi = {};
+let seqLength = 0;
+let domainRanges = [];
+let showPlddt = true;
+let showDomains = false;
+let trackCanvas = null;
+let currentGeneUniprot = '';
 
 async function init() {
     const [gRes, vRes] = await Promise.all([
@@ -163,10 +200,12 @@ async function init() {
 
     viewer = $3Dmol.createViewer('viewport', { backgroundColor: '#ffffff' });
     setupTooltip();
+    setupTrackHandlers();
 
     document.getElementById('zoomIn').addEventListener('click', () => viewer.zoom(1.25));
     document.getElementById('zoomOut').addEventListener('click', () => viewer.zoom(0.8));
     document.getElementById('zoomReset').addEventListener('click', () => viewer.zoomTo());
+    window.addEventListener('resize', () => { if (trackCanvas && trackCanvas.clientWidth) drawTracks(); });
 }
 
 async function loadGene(gene) {
@@ -175,6 +214,9 @@ async function loadGene(gene) {
     const info = genesData.find(g => g.gene === gene);
     if (!varData || !info || !info.uniprot) return;
     currentVariants = varData;
+    currentGeneUniprot = info.uniprot;
+    selectedResi = null;
+    domainRanges = [];
 
     const loading = document.getElementById('loading');
     loading.querySelector('div:last-child').textContent = `Loading ${gene} (${info.uniprot}) from AlphaFold…`;
@@ -203,6 +245,12 @@ async function loadGene(gene) {
         viewer.zoomTo();
         viewer.render();
         buildSidebar(gene, varData, info);
+
+        // Parse pLDDT + sequence length from PDB b-factor column
+        parsePlddt(pdbText);
+        document.getElementById('trackPanel').style.display = '';
+        document.getElementById('axisLabel').textContent = `1 → ${seqLength}`;
+        requestAnimationFrame(() => drawTracks());
     } catch (e) {
         console.error(e);
         loading.querySelector('div:last-child').textContent = `Error loading structure for ${gene}. Check console.`;
@@ -253,44 +301,225 @@ function buildSidebar(gene, varData, info) {
 }
 
 function setupTooltip() {
-    const tooltip = document.getElementById('tooltip');
     const elem = document.getElementById('viewport');
 
-    // Track hovered residue via 3Dmol hover callbacks (most reliable)
+    // Track hovered residue via 3Dmol hover callbacks (move playhead on hover)
     viewer.setHoverable({}, true,
-        function(atom) { hoveredResi = atom ? atom.resi : null; },
+        function(atom) {
+            hoveredResi = atom ? atom.resi : null;
+            if (hoveredResi != null) { selectedResi = hoveredResi; drawTracks(); }
+        },
         function() { /* keep last hovered */ }
     );
 
     elem.addEventListener('click', (ev) => {
-        const resi = hoveredResi;
-        if (resi == null) { tooltip.classList.remove('active'); return; }
-        const pData = currentVariants ? currentVariants.find(p => p.position === resi) : null;
-        if (!pData) { tooltip.classList.remove('active'); return; }
-        showVariantTooltip(pData, ev);
+        if (hoveredResi != null) selectResidue(hoveredResi, ev, true);
     });
 }
 
-function showVariantTooltip(pData, ev) {
-    const tooltip = document.getElementById('tooltip');
-    const elem = document.getElementById('viewport');
-    const c = colorToCSS(rateToColor(pData.path_rate));
-    const varsHtml = pData.variants.map(v =>
-        `<div class="tt-var-item" style="color:${v.label==='Pathogenic' ? '#fca5a5' : '#86efac'}">${v.label}: ${v.ref}→${v.alt}</div>`
-    ).join('');
-    tooltip.innerHTML = `
-        <h3 style="color:${c}">Position ${pData.position}</h3>
-        <div class="tt-row"><span class="tt-label">Path rate:</span><span class="tt-val" style="color:${c}">${(pData.path_rate*100).toFixed(1)}%</span></div>
-        <div class="tt-row"><span class="tt-label">Total variants:</span><span class="tt-val">${pData.count}</span></div>
-        <div class="tt-row"><span class="tt-label">Pathogenic:</span><span class="tt-val">${pData.n_pathogenic}</span></div>
-        <div class="tt-row"><span class="tt-label">Benign:</span><span class="tt-val">${pData.n_benign}</span></div>
-        <div class="tt-vars">${varsHtml}</div>
-    `;
-    tooltip.classList.add('active');
-    const x = ev ? ev.offsetX : elem.clientWidth / 2;
-    const y = ev ? ev.offsetY : elem.clientHeight / 2;
-    tooltip.style.left = Math.min(x + 12, elem.clientWidth - 290) + 'px';
-    tooltip.style.top = Math.min(y + 12, elem.clientHeight - 200) + 'px';
+/* ── pLDDT + sequence parsing ── */
+function parsePlddt(pdbText) {
+    pLddtByResi = {};
+    seqLength = 0;
+    const lines = pdbText.split('\n');
+    for (const line of lines) {
+        if (line.startsWith('ATOM') && line.substr(12, 4).trim() === 'CA') {
+            const resno = parseInt(line.substr(22, 4));
+            const plddt = parseFloat(line.substr(60, 6));
+            if (!isNaN(resno)) {
+                pLddtByResi[resno] = isNaN(plddt) ? null : plddt;
+                if (resno > seqLength) seqLength = resno;
+            }
+        }
+    }
+}
+
+function plddtColor(v) {
+    if (v >= 90) return '#0053d6';
+    if (v >= 70) return '#65cbf3';
+    if (v >= 50) return '#ffdb13';
+    return '#ff7d45';
+}
+
+async function fetchDomains(uniprot) {
+    try {
+        const url = `https://rest.uniprot.org/uniprotkb/${uniprot}?fields=ft_domain,ft_chain,ft_region,ft_repeat,ft_coiled,ft_zn_fing,ft_transmem,ft_bind,ft_act_site,ft_motif,ft_dna_bind,ft_site`;
+        const d = await fetch(url).then(r => r.json());
+        const feats = d.features || [];
+        domainRanges = feats.filter(f => f.location && f.location.start && f.location.end && f.location.start.value && f.location.end.value)
+            .map(f => ({ type: f.type, start: +f.location.start.value, end: +f.location.end.value, desc: f.description || '' }));
+    } catch (e) { console.error('domain fetch failed', e); domainRanges = []; }
+}
+
+/* ── Track drawing ── */
+function resToX(r) {
+    const pad = 12;
+    const w = (trackCanvas.clientWidth || 800) - pad * 2;
+    if (seqLength <= 1) return pad;
+    return pad + (r - 1) / (seqLength - 1) * w;
+}
+
+function xToRes(ev) {
+    const rect = trackCanvas.getBoundingClientRect();
+    const pad = 12;
+    const x = ev.clientX - rect.left;
+    const w = rect.width - pad * 2;
+    if (x < pad - 3 || x > rect.width - pad + 3) return null;
+    let r = Math.round(1 + (x - pad) / w * (seqLength - 1));
+    r = Math.max(1, Math.min(seqLength, r));
+    return r;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+}
+
+function drawTracks() {
+    if (!trackCanvas || trackCanvas.clientWidth === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = trackCanvas.clientWidth;
+    const cssH = trackCanvas.clientHeight;
+    trackCanvas.width = cssW * dpr;
+    trackCanvas.height = cssH * dpr;
+    const ctx = trackCanvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const pad = 12;
+    const trackW = cssW - pad * 2;
+    const axisH = 16;
+    const ticks = 5;
+
+    // Axis ticks + labels
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px sans-serif';
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= ticks; i++) {
+        const r = Math.round(1 + i / ticks * (seqLength - 1));
+        const x = pad + i / ticks * trackW;
+        ctx.fillText(String(r), x - 6, cssH - 4);
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cssH - axisH); ctx.stroke();
+    }
+
+    const rows = [{ type: 'variant', label: 'Variants', h: 16 }];
+    if (showPlddt) rows.push({ type: 'plddt', label: 'pLDDT', h: 16 });
+    if (showDomains) rows.push({ type: 'domain', label: 'Domains', h: 16 });
+
+    let y = 4;
+    rows.forEach(row => {
+        const top = y;
+        ctx.fillStyle = '#64748b';
+        ctx.font = '9px sans-serif';
+        ctx.fillText(row.label, 2, top + 11);
+        ctx.strokeStyle = '#f1f5f9';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(pad, top + row.h / 2); ctx.lineTo(pad + trackW, top + row.h / 2); ctx.stroke();
+
+        if (row.type === 'variant') {
+            (currentVariants || []).forEach(p => {
+                const x = resToX(p.position);
+                ctx.fillStyle = colorToCSS(rateToColor(p.path_rate));
+                ctx.fillRect(x - 1.5, top, 3, row.h);
+            });
+        } else if (row.type === 'plddt') {
+            for (let r = 1; r <= seqLength; r++) {
+                const v = pLddtByResi[r];
+                if (v == null) continue;
+                ctx.fillStyle = plddtColor(v);
+                const x = resToX(r);
+                ctx.fillRect(x - 0.6, top + 1, 1.2, row.h - 2);
+            }
+        } else if (row.type === 'domain') {
+            domainRanges.forEach(d => {
+                const x1 = resToX(d.start), x2 = resToX(d.end);
+                ctx.fillStyle = 'rgba(99,102,241,0.30)';
+                ctx.strokeStyle = '#6366f1';
+                ctx.lineWidth = 1;
+                roundRect(ctx, x1, top + 2, Math.max(2, x2 - x1), row.h - 4, 3);
+                ctx.fill(); ctx.stroke();
+            });
+        }
+        y += row.h + 3;
+    });
+
+    // Playhead
+    if (selectedResi != null) {
+        const x = resToX(selectedResi);
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cssH - axisH); ctx.stroke();
+    }
+}
+
+function selectResidue(r, ev, doZoom) {
+    if (r == null || r < 1 || r > seqLength) return;
+    selectedResi = r;
+    drawTracks();
+    if (doZoom) viewer.zoomTo({ resi: r }, 400);
+    const v = currentVariants ? currentVariants.find(p => p.position === r) : null;
+    const plddt = pLddtByResi[r];
+    const dom = domainRanges.find(d => r >= d.start && r <= d.end);
+    if (ev) showResidueInfo(r, v, plddt, dom, ev);
+}
+
+function showResidueInfo(r, v, plddt, dom, ev) {
+    const tip = document.getElementById('infoTip');
+    let html = `<h3>Residue ${r}</h3>`;
+    if (v) {
+        const c = colorToCSS(rateToColor(v.path_rate));
+        html += `<div class="tt-row"><span class="tt-label">Path rate</span><span class="tt-val" style="color:${c}">${(v.path_rate*100).toFixed(1)}%</span></div>`;
+        html += `<div class="tt-row"><span class="tt-label">Pathogenic</span><span class="tt-val">${v.n_pathogenic}</span></div>`;
+        html += `<div class="tt-row"><span class="tt-label">Benign</span><span class="tt-val">${v.n_benign}</span></div>`;
+        const subs = v.variants.map(x => `<div class="tt-var-item" style="color:${x.label==='Pathogenic'?'#fca5a5':'#86efac'}">${x.label}: ${x.ref}→${x.alt}</div>`).join('');
+        html += `<div class="tt-vars">${subs}</div>`;
+    } else {
+        html += `<div class="tt-row"><span class="tt-label">Variant</span><span class="tt-val">none</span></div>`;
+    }
+    if (plddt != null) html += `<div class="tt-row"><span class="tt-label">pLDDT</span><span class="tt-val">${plddt.toFixed(1)}</span></div>`;
+    if (dom) html += `<div class="tt-row"><span class="tt-label">${dom.type}</span><span class="tt-val">${dom.desc || (dom.start+'-'+dom.end)}</span></div>`;
+    tip.innerHTML = html;
+    tip.classList.add('active');
+    const x = Math.min(ev.clientX + 14, window.innerWidth - 310);
+    const y = Math.min(ev.clientY + 14, window.innerHeight - 160);
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+}
+
+function setupTrackHandlers() {
+    trackCanvas = document.getElementById('trackCanvas');
+
+    trackCanvas.addEventListener('mousemove', (ev) => {
+        const r = xToRes(ev);
+        if (r != null) selectResidue(r, ev, false);
+    });
+    trackCanvas.addEventListener('mouseleave', () => {
+        document.getElementById('infoTip').classList.remove('active');
+    });
+    trackCanvas.addEventListener('click', (ev) => {
+        const r = xToRes(ev);
+        if (r != null) selectResidue(r, ev, true);
+    });
+
+    document.getElementById('togglePlddt').addEventListener('click', (e) => {
+        showPlddt = !showPlddt;
+        e.target.classList.toggle('active', showPlddt);
+        drawTracks();
+    });
+    document.getElementById('toggleDomains').addEventListener('click', async (e) => {
+        showDomains = !showDomains;
+        e.target.classList.toggle('active', showDomains);
+        if (showDomains && domainRanges.length === 0 && currentGeneUniprot) {
+            await fetchDomains(currentGeneUniprot);
+        }
+        drawTracks();
+    });
 }
 
 init();
